@@ -29,6 +29,14 @@ if ! command -v curl >/dev/null 2>&1; then
   exit 1
 fi
 
+bytes_to_mb() {
+  awk -v b="$1" 'BEGIN{printf "%.3f", b/1048576}'
+}
+
+bps_to_mbps() {
+  awk -v bps="$1" 'BEGIN{printf "%.3f", bps/1048576}'
+}
+
 # 累加变量（秒）
 sum_namelookup=0
 sum_connect=0
@@ -38,6 +46,8 @@ sum_starttransfer=0
 sum_total=0
 sum_speed=0
 sum_size=0
+sum_upload_size=0
+sum_upload_speed=0
 
 success_count=0
 curl_fail_count=0
@@ -45,17 +55,21 @@ http_error_count=0
 
 printf "开始测试: %s\n总次数: %s\n\n" "$URL" "$COUNT"
 
+index_width=${#COUNT}
+
 for ((i = 1; i <= COUNT; i++)); do
   out="$(curl -o /dev/null -sS -L \
     --connect-timeout 10 \
     --max-time 30 \
-    -w "code=%{http_code} namelookup=%{time_namelookup} connect=%{time_connect} appconnect=%{time_appconnect} pretransfer=%{time_pretransfer} starttransfer=%{time_starttransfer} total=%{time_total} speed=%{speed_download} size=%{size_download} redirects=%{num_redirects}" \
+    -w "code=%{http_code} namelookup=%{time_namelookup} connect=%{time_connect} appconnect=%{time_appconnect} pretransfer=%{time_pretransfer} starttransfer=%{time_starttransfer} total=%{time_total} speed=%{speed_download} size=%{size_download} upload_size=%{size_upload} upload_speed=%{speed_upload} final_url=%{url_effective} redirects=%{num_redirects}" \
     "$URL" 2>&1)"
   rc=$?
 
+  idx=$(printf "%${index_width}d" "$i")
+
   if [[ $rc -ne 0 ]]; then
     ((curl_fail_count++))
-    printf "[%d/%d] CURL失败: %s\n" "$i" "$COUNT" "$out"
+    printf "[%s/%d] %-8s %s\n" "$idx" "$COUNT" "CURL失败" "$out"
     continue
   fi
 
@@ -68,11 +82,20 @@ for ((i = 1; i <= COUNT; i++)); do
   total="$(awk '{for(i=1;i<=NF;i++) if($i ~ /^total=/){sub("total=","",$i); print $i}}' <<<"$out")"
   speed="$(awk '{for(i=1;i<=NF;i++) if($i ~ /^speed=/){sub("speed=","",$i); print $i}}' <<<"$out")"
   size="$(awk '{for(i=1;i<=NF;i++) if($i ~ /^size=/){sub("size=","",$i); print $i}}' <<<"$out")"
+  upload_size="$(awk '{for(i=1;i<=NF;i++) if($i ~ /^upload_size=/){sub("upload_size=","",$i); print $i}}' <<<"$out")"
+  upload_speed="$(awk '{for(i=1;i<=NF;i++) if($i ~ /^upload_speed=/){sub("upload_speed=","",$i); print $i}}' <<<"$out")"
+  final_url="$(awk '{for(i=1;i<=NF;i++) if($i ~ /^final_url=/){sub("final_url=","",$i); print $i}}' <<<"$out")"
   redirects="$(awk '{for(i=1;i<=NF;i++) if($i ~ /^redirects=/){sub("redirects=","",$i); print $i}}' <<<"$out")"
+
+  dl_speed_mb=$(bps_to_mbps "$speed")
+  dl_size_mb=$(bytes_to_mb "$size")
+  ul_speed_mb=$(bps_to_mbps "$upload_speed")
+  ul_size_mb=$(bytes_to_mb "$upload_size")
 
   if [[ "$code" -lt 200 || "$code" -ge 400 ]]; then
     ((http_error_count++))
-    printf "[%d/%d] HTTP异常 code=%s total=%ss redirects=%s\n" "$i" "$COUNT" "$code" "$total" "$redirects"
+    printf "[%s/%d] %-8s code=%3s total=%9.6fs connect=%9.6fs tls=%9.6fs ttfb=%9.6fs dl=%8.3fMB/s dl_size=%8.3fMB ul=%8.3fMB/s ul_size=%8.3fMB redirects=%2s final_url=%s\n" \
+      "$idx" "$COUNT" "HTTP异常" "$code" "$total" "$connect" "$appconnect" "$starttransfer" "$dl_speed_mb" "$dl_size_mb" "$ul_speed_mb" "$ul_size_mb" "$redirects" "$final_url"
     continue
   fi
 
@@ -84,22 +107,23 @@ for ((i = 1; i <= COUNT; i++)); do
   sum_pretransfer=$(awk -v a="$sum_pretransfer" -v b="$pretransfer" 'BEGIN{printf "%.6f", a+b}')
   sum_starttransfer=$(awk -v a="$sum_starttransfer" -v b="$starttransfer" 'BEGIN{printf "%.6f", a+b}')
   sum_total=$(awk -v a="$sum_total" -v b="$total" 'BEGIN{printf "%.6f", a+b}')
-  sum_speed=$(awk -v a="$sum_speed" -v b="$speed" 'BEGIN{printf "%.2f", a+b}')
-  sum_size=$(awk -v a="$sum_size" -v b="$size" 'BEGIN{printf "%.0f", a+b}')
+  sum_speed=$(awk -v a="$sum_speed" -v b="$speed" 'BEGIN{printf "%.6f", a+b}')
+  sum_size=$(awk -v a="$sum_size" -v b="$size" 'BEGIN{printf "%.6f", a+b}')
+  sum_upload_size=$(awk -v a="$sum_upload_size" -v b="$upload_size" 'BEGIN{printf "%.6f", a+b}')
+  sum_upload_speed=$(awk -v a="$sum_upload_speed" -v b="$upload_speed" 'BEGIN{printf "%.6f", a+b}')
 
-  printf "[%d/%d] OK code=%s total=%ss connect=%ss tls=%ss ttfb=%ss speed=%sB/s redirects=%s\n" \
-    "$i" "$COUNT" "$code" "$total" "$connect" "$appconnect" "$starttransfer" "$speed" "$redirects"
+  printf "[%s/%d] %-8s code=%3s total=%9.6fs connect=%9.6fs tls=%9.6fs ttfb=%9.6fs dl=%8.3fMB/s dl_size=%8.3fMB ul=%8.3fMB/s ul_size=%8.3fMB redirects=%2s final_url=%s\n" \
+    "$idx" "$COUNT" "OK" "$code" "$total" "$connect" "$appconnect" "$starttransfer" "$dl_speed_mb" "$dl_size_mb" "$ul_speed_mb" "$ul_size_mb" "$redirects" "$final_url"
 done
 
-echo
-printf "测试完成。\n"
+printf "\n测试完成。\n"
 printf "总请求: %d\n" "$COUNT"
 printf "成功(2xx/3xx): %d\n" "$success_count"
 printf "HTTP异常(4xx/5xx/其他): %d\n" "$http_error_count"
 printf "CURL失败(超时/网络/DNS/TLS等): %d\n" "$curl_fail_count"
 
 if [[ "$success_count" -eq 0 ]]; then
-  echo "\n没有可用于计算平均值的成功请求。"
+  printf "\n没有可用于计算平均值的成功请求。\n"
   exit 2
 fi
 
@@ -109,15 +133,24 @@ avg_appconnect=$(awk -v s="$sum_appconnect" -v n="$success_count" 'BEGIN{printf 
 avg_pretransfer=$(awk -v s="$sum_pretransfer" -v n="$success_count" 'BEGIN{printf "%.6f", s/n}')
 avg_starttransfer=$(awk -v s="$sum_starttransfer" -v n="$success_count" 'BEGIN{printf "%.6f", s/n}')
 avg_total=$(awk -v s="$sum_total" -v n="$success_count" 'BEGIN{printf "%.6f", s/n}')
-avg_speed=$(awk -v s="$sum_speed" -v n="$success_count" 'BEGIN{printf "%.2f", s/n}')
-avg_size=$(awk -v s="$sum_size" -v n="$success_count" 'BEGIN{printf "%.0f", s/n}')
+avg_speed=$(awk -v s="$sum_speed" -v n="$success_count" 'BEGIN{printf "%.6f", s/n}')
+avg_size=$(awk -v s="$sum_size" -v n="$success_count" 'BEGIN{printf "%.6f", s/n}')
+avg_upload_size=$(awk -v s="$sum_upload_size" -v n="$success_count" 'BEGIN{printf "%.6f", s/n}')
+avg_upload_speed=$(awk -v s="$sum_upload_speed" -v n="$success_count" 'BEGIN{printf "%.6f", s/n}')
 
-echo "\n====== 平均值（仅统计成功请求） ======"
-printf "DNS解析时间(time_namelookup):   %ss\n" "$avg_namelookup"
-printf "TCP连接时间(time_connect):       %ss\n" "$avg_connect"
-printf "TLS握手时间(time_appconnect):    %ss (HTTP时通常为0)\n" "$avg_appconnect"
-printf "请求准备时间(time_pretransfer):  %ss\n" "$avg_pretransfer"
-printf "首字节时间(time_starttransfer):  %ss\n" "$avg_starttransfer"
-printf "总耗时(time_total):              %ss\n" "$avg_total"
-printf "平均下载速度(speed_download):    %s B/s\n" "$avg_speed"
-printf "平均下载大小(size_download):     %s bytes\n" "$avg_size"
+avg_speed_mb=$(bps_to_mbps "$avg_speed")
+avg_size_mb=$(bytes_to_mb "$avg_size")
+avg_upload_speed_mb=$(bps_to_mbps "$avg_upload_speed")
+avg_upload_size_mb=$(bytes_to_mb "$avg_upload_size")
+
+printf "\n====== 平均值（仅统计成功请求） ======\n"
+printf "DNS解析时间(time_namelookup):   %9.6fs\n" "$avg_namelookup"
+printf "TCP连接时间(time_connect):       %9.6fs\n" "$avg_connect"
+printf "TLS握手时间(time_appconnect):    %9.6fs (HTTP时通常为0)\n" "$avg_appconnect"
+printf "请求准备时间(time_pretransfer):  %9.6fs\n" "$avg_pretransfer"
+printf "首字节时间(time_starttransfer):  %9.6fs\n" "$avg_starttransfer"
+printf "总耗时(time_total):              %9.6fs\n" "$avg_total"
+printf "平均下载速度(speed_download):    %8.3f MB/s\n" "$avg_speed_mb"
+printf "平均下载大小(size_download):     %8.3f MB\n" "$avg_size_mb"
+printf "平均上传速度(speed_upload):      %8.3f MB/s\n" "$avg_upload_speed_mb"
+printf "平均上传大小(size_upload):       %8.3f MB\n" "$avg_upload_size_mb"
