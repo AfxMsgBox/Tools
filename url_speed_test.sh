@@ -29,6 +29,9 @@ if ! command -v curl >/dev/null 2>&1; then
   exit 1
 fi
 
+# 进度索引对齐宽度（按总次数的位数，使 [1/10] 与 [10/10] 对齐）
+idx_width=${#COUNT}
+
 # 累加变量（秒）
 sum_namelookup=0
 sum_connect=0
@@ -38,6 +41,10 @@ sum_starttransfer=0
 sum_total=0
 sum_speed=0
 sum_size=0
+sum_upspeed=0
+sum_upsize=0
+
+last_url=""
 
 success_count=0
 curl_fail_count=0
@@ -49,13 +56,13 @@ for ((i = 1; i <= COUNT; i++)); do
   out="$(curl -o /dev/null -sS -L \
     --connect-timeout 10 \
     --max-time 30 \
-    -w "code=%{http_code} namelookup=%{time_namelookup} connect=%{time_connect} appconnect=%{time_appconnect} pretransfer=%{time_pretransfer} starttransfer=%{time_starttransfer} total=%{time_total} speed=%{speed_download} size=%{size_download} redirects=%{num_redirects}" \
+    -w "code=%{http_code} namelookup=%{time_namelookup} connect=%{time_connect} appconnect=%{time_appconnect} pretransfer=%{time_pretransfer} starttransfer=%{time_starttransfer} total=%{time_total} speed=%{speed_download} size=%{size_download} upspeed=%{speed_upload} upsize=%{size_upload} redirects=%{num_redirects} url=%{url_effective}" \
     "$URL" 2>&1)"
   rc=$?
 
   if [[ $rc -ne 0 ]]; then
     ((curl_fail_count++))
-    printf "[%d/%d] CURL失败: %s\n" "$i" "$COUNT" "$out"
+    printf "[%*d/%d] CURL失败: %s\n" "$idx_width" "$i" "$COUNT" "$out"
     continue
   fi
 
@@ -68,15 +75,21 @@ for ((i = 1; i <= COUNT; i++)); do
   total="$(awk '{for(i=1;i<=NF;i++) if($i ~ /^total=/){sub("total=","",$i); print $i}}' <<<"$out")"
   speed="$(awk '{for(i=1;i<=NF;i++) if($i ~ /^speed=/){sub("speed=","",$i); print $i}}' <<<"$out")"
   size="$(awk '{for(i=1;i<=NF;i++) if($i ~ /^size=/){sub("size=","",$i); print $i}}' <<<"$out")"
+  upspeed="$(awk '{for(i=1;i<=NF;i++) if($i ~ /^upspeed=/){sub("upspeed=","",$i); print $i}}' <<<"$out")"
+  upsize="$(awk '{for(i=1;i<=NF;i++) if($i ~ /^upsize=/){sub("upsize=","",$i); print $i}}' <<<"$out")"
   redirects="$(awk '{for(i=1;i<=NF;i++) if($i ~ /^redirects=/){sub("redirects=","",$i); print $i}}' <<<"$out")"
+  # url_effective 放在格式串末尾，直接截取（URL 不含空格）
+  url_effective="${out##*url=}"
 
   if [[ "$code" -lt 200 || "$code" -ge 400 ]]; then
     ((http_error_count++))
-    printf "[%d/%d] HTTP异常 code=%s total=%ss redirects=%s\n" "$i" "$COUNT" "$code" "$total" "$redirects"
+    printf "[%*d/%d] HTTP异常 code=%s total=%ss redirects=%s url=%s\n" \
+      "$idx_width" "$i" "$COUNT" "$code" "$total" "$redirects" "$url_effective"
     continue
   fi
 
   ((success_count++))
+  last_url="$url_effective"
 
   sum_namelookup=$(awk -v a="$sum_namelookup" -v b="$namelookup" 'BEGIN{printf "%.6f", a+b}')
   sum_connect=$(awk -v a="$sum_connect" -v b="$connect" 'BEGIN{printf "%.6f", a+b}')
@@ -86,9 +99,11 @@ for ((i = 1; i <= COUNT; i++)); do
   sum_total=$(awk -v a="$sum_total" -v b="$total" 'BEGIN{printf "%.6f", a+b}')
   sum_speed=$(awk -v a="$sum_speed" -v b="$speed" 'BEGIN{printf "%.2f", a+b}')
   sum_size=$(awk -v a="$sum_size" -v b="$size" 'BEGIN{printf "%.0f", a+b}')
+  sum_upspeed=$(awk -v a="$sum_upspeed" -v b="$upspeed" 'BEGIN{printf "%.2f", a+b}')
+  sum_upsize=$(awk -v a="$sum_upsize" -v b="$upsize" 'BEGIN{printf "%.0f", a+b}')
 
-  printf "[%d/%d] OK code=%s total=%ss connect=%ss tls=%ss ttfb=%ss speed=%sB/s redirects=%s\n" \
-    "$i" "$COUNT" "$code" "$total" "$connect" "$appconnect" "$starttransfer" "$speed" "$redirects"
+  printf "[%*d/%d] OK code=%s total=%ss connect=%ss tls=%ss ttfb=%ss speed=%sB/s upspeed=%sB/s upsize=%sB redirects=%s\n" \
+    "$idx_width" "$i" "$COUNT" "$code" "$total" "$connect" "$appconnect" "$starttransfer" "$speed" "$upspeed" "$upsize" "$redirects"
 done
 
 echo
@@ -99,7 +114,7 @@ printf "HTTP异常(4xx/5xx/其他): %d\n" "$http_error_count"
 printf "CURL失败(超时/网络/DNS/TLS等): %d\n" "$curl_fail_count"
 
 if [[ "$success_count" -eq 0 ]]; then
-  echo "\n没有可用于计算平均值的成功请求。"
+  printf "\n没有可用于计算平均值的成功请求。\n"
   exit 2
 fi
 
@@ -111,9 +126,11 @@ avg_starttransfer=$(awk -v s="$sum_starttransfer" -v n="$success_count" 'BEGIN{p
 avg_total=$(awk -v s="$sum_total" -v n="$success_count" 'BEGIN{printf "%.6f", s/n}')
 avg_speed=$(awk -v s="$sum_speed" -v n="$success_count" 'BEGIN{printf "%.2f", s/n}')
 avg_size=$(awk -v s="$sum_size" -v n="$success_count" 'BEGIN{printf "%.0f", s/n}')
+avg_upspeed=$(awk -v s="$sum_upspeed" -v n="$success_count" 'BEGIN{printf "%.2f", s/n}')
+avg_upsize=$(awk -v s="$sum_upsize" -v n="$success_count" 'BEGIN{printf "%.0f", s/n}')
 
-echo "\n====== 平均值（仅统计成功请求） ======"
-printf "DNS解析时间(time_namelookup):   %ss\n" "$avg_namelookup"
+printf "\n====== 平均值（仅统计成功请求） ======\n"
+printf "DNS解析时间(time_namelookup):    %ss\n" "$avg_namelookup"
 printf "TCP连接时间(time_connect):       %ss\n" "$avg_connect"
 printf "TLS握手时间(time_appconnect):    %ss (HTTP时通常为0)\n" "$avg_appconnect"
 printf "请求准备时间(time_pretransfer):  %ss\n" "$avg_pretransfer"
@@ -121,3 +138,6 @@ printf "首字节时间(time_starttransfer):  %ss\n" "$avg_starttransfer"
 printf "总耗时(time_total):              %ss\n" "$avg_total"
 printf "平均下载速度(speed_download):    %s B/s\n" "$avg_speed"
 printf "平均下载大小(size_download):     %s bytes\n" "$avg_size"
+printf "平均上传速度(speed_upload):      %s B/s\n" "$avg_upspeed"
+printf "平均上传大小(size_upload):       %s bytes\n" "$avg_upsize"
+printf "最终URL(url_effective):          %s\n" "$last_url"
