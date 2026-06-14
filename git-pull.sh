@@ -8,7 +8,11 @@ LOCAL_DIR="${4:-.}"
 
 if [ -z "$GIT_URL" ] || [ -z "$BRANCH" ] || [ -z "$REMOTE_DIR" ]; then
     echo "用法:"
-    echo "  $0 <git地址> <分支名> <项目子目录> [本地目录]"
+    echo "  $0 <git地址> <分支名> <远程父目录> [本地目录]"
+    echo
+    echo "说明:"
+    echo "  拉取 <远程父目录> 下的所有直接子目录到 [本地目录]。"
+    echo "  子目录内的文件会一并保留；<远程父目录> 根层级的文件不会单独拉取。"
     echo
     echo "示例:"
     echo "  $0 https://github.com/openwrt/openwrt.git main package/network/services ./services"
@@ -25,11 +29,12 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 mkdir -p "$LOCAL_DIR"
+LOCAL_DIR_ABS="$(cd "$LOCAL_DIR" && pwd)"
 
 echo "Git 地址: $GIT_URL"
 echo "分支: $BRANCH"
-echo "远程目录: $REMOTE_DIR"
-echo "本地目录: $LOCAL_DIR"
+echo "远程父目录: $REMOTE_DIR"
+echo "本地目录: $LOCAL_DIR_ABS"
 echo
 
 cd "$TMP_DIR"
@@ -47,11 +52,17 @@ if [ ! -d "$REMOTE_DIR" ]; then
     exit 1
 fi
 
-# 复制目录内容，包括隐藏文件
-(
-    shopt -s dotglob nullglob
-    cp -a "$REMOTE_DIR"/* "$OLDPWD/$LOCAL_DIR"/
-)
+copied_count=0
 
-echo
-echo "完成: 已将 $REMOTE_DIR 的内容拉取到 $LOCAL_DIR"
+# 复制指定目录下的所有直接子目录（包含隐藏目录），并保留目录内部内容。
+while IFS= read -r -d '' subdir; do
+    cp -a "$subdir" "$LOCAL_DIR_ABS"/
+    copied_count=$((copied_count + 1))
+done < <(find "$REMOTE_DIR" -mindepth 1 -maxdepth 1 -type d -print0)
+
+if [ "$copied_count" -eq 0 ]; then
+    echo "警告: $REMOTE_DIR 下没有可复制的子目录"
+else
+    echo
+    echo "完成: 已将 $REMOTE_DIR 下的 $copied_count 个子目录拉取到 $LOCAL_DIR_ABS"
+fi
