@@ -1,0 +1,448 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_CONFIG="${SCRIPT_DIR}/unifi_routeros_sync.conf"
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_GREEN=$'\033[32m'
+  C_RED=$'\033[31m'
+  C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'
+else
+  C_RESET=""
+  C_BOLD=""
+  C_DIM=""
+  C_GREEN=""
+  C_RED=""
+  C_YELLOW=""
+  C_BLUE=""
+fi
+
+log_section() {
+  printf '\n%s== %s ==%s\n' "$C_BOLD$C_BLUE" "$1" "$C_RESET" >&2
+}
+
+log_info() {
+  printf '%s•%s %s\n' "$C_BLUE" "$C_RESET" "$1" >&2
+}
+
+log_success() {
+  printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$1" >&2
+}
+
+log_warn() {
+  printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$1" >&2
+}
+
+log_error() {
+  printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$1" >&2
+}
+
+print_kv() {
+  printf '  %s%-24s%s %s\n' "$C_DIM" "$1" "$C_RESET" "$2" >&2
+}
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  sync_unifi_names.sh [--config PATH] [--routeros-password PASSWORD] [--unifi-password PASSWORD]
+
+Silent mode:
+  If and only if all three arguments are provided, the script runs non-interactively.
+
+Interactive mode:
+  If any of the three arguments is missing, the script reads the default key-value config as defaults,
+  prompts step by step, saves the config without passwords, previews changes, then asks "是否执行同步? [y/N]:" before writing.
+USAGE
+}
+
+CONFIG_ARG=""
+ROUTEROS_PASSWORD_ARG=""
+UNIFI_PASSWORD_ARG=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --config)
+      [[ $# -ge 2 ]] || { echo "Missing value for --config" >&2; exit 1; }
+      CONFIG_ARG="$2"
+      shift 2
+      ;;
+    --routeros-password)
+      [[ $# -ge 2 ]] || { echo "Missing value for --routeros-password" >&2; exit 1; }
+      ROUTEROS_PASSWORD_ARG="$2"
+      shift 2
+      ;;
+    --unifi-password)
+      [[ $# -ge 2 ]] || { echo "Missing value for --unifi-password" >&2; exit 1; }
+      UNIFI_PASSWORD_ARG="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unsupported argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [[ -n "$CONFIG_ARG" && -n "$ROUTEROS_PASSWORD_ARG" && -n "$UNIFI_PASSWORD_ARG" ]]; then
+  SILENT=1
+  CONFIG_PATH="$CONFIG_ARG"
+  ROUTEROS_PASSWORD="$ROUTEROS_PASSWORD_ARG"
+  UNIFI_PASSWORD="$UNIFI_PASSWORD_ARG"
+else
+  SILENT=0
+  CONFIG_PATH="${CONFIG_ARG:-$DEFAULT_CONFIG}"
+  ROUTEROS_PASSWORD=""
+  UNIFI_PASSWORD=""
+fi
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "Missing required command: $1" >&2
+    echo "On Debian, install dependencies with: sudo apt-get install curl jq" >&2
+    exit 1
+  }
+}
+
+config_get() {
+  local file="$1"
+  local key="$2"
+  local fallback="$3"
+  local value
+  if [[ -f "$file" ]]; then
+    value="$(awk -v wanted="$key" '
+      $0 ~ /^[[:space:]]*($|#)/ { next }
+      $1 == wanted {
+        $1=""
+        sub(/^[[:space:]]+/, "")
+        print
+        found=1
+        exit
+      }
+      END { if (!found) exit 1 }
+    ' "$file" 2>/dev/null || true)"
+    if [[ -n "$value" ]]; then
+      printf '%s\n' "$value"
+      return
+    fi
+  fi
+  printf '%s\n' "$fallback"
+}
+
+prompt_default() {
+  local label="$1"
+  local default="$2"
+  local value
+  read -r -p "$label [$default]: " value
+  printf '%s\n' "${value:-$default}"
+}
+
+prompt_secret() {
+  local label="$1"
+  local value
+  read -r -s -p "$label: " value
+  printf '\n' >&2
+  printf '%s\n' "$value"
+}
+
+normalize_bool_verify_ssl() {
+  local skip_ssl="$1"
+  case "${skip_ssl,,}" in
+    y|yes|true|1|是|对) printf 'false\n' ;;
+    n|no|false|0|否|不) printf 'true\n' ;;
+    *) printf 'false\n' ;;
+  esac
+}
+
+save_config() {
+  local path="$1"
+  mkdir -p "$(dirname "$path")"
+  cat > "$path" <<EOF_CONFIG
+RouterOSIP $ROUTEROS_HOST
+RouterOSPort $ROUTEROS_PORT
+RouterOSScheme $ROUTEROS_SCHEME
+RouterOSUser $ROUTEROS_USERNAME
+CloudKeyIP $UNIFI_HOST
+CloudKeyPort $UNIFI_PORT
+UniFiUser $UNIFI_USERNAME
+UniFiSite $UNIFI_SITE
+UniFiVerifySSL $UNIFI_VERIFY_SSL
+EOF_CONFIG
+  chmod 600 "$path" 2>/dev/null || true
+}
+
+curl_fail() {
+  local msg="$1"
+  log_error "$msg"
+  exit 1
+}
+
+load_config_values() {
+  [[ -f "$CONFIG_PATH" ]] || {
+    if [[ "$SILENT" -eq 1 ]]; then
+      echo "Config file not found: $CONFIG_PATH" >&2
+      exit 1
+    fi
+  }
+
+  ROUTEROS_HOST="$(config_get "$CONFIG_PATH" 'RouterOSIP' '192.168.88.1')"
+  ROUTEROS_PORT="$(config_get "$CONFIG_PATH" 'RouterOSPort' '443')"
+  ROUTEROS_SCHEME="$(config_get "$CONFIG_PATH" 'RouterOSScheme' 'https')"
+  ROUTEROS_USERNAME="$(config_get "$CONFIG_PATH" 'RouterOSUser' 'admin')"
+
+  UNIFI_HOST="$(config_get "$CONFIG_PATH" 'CloudKeyIP' '192.168.88.2')"
+  UNIFI_PORT="$(config_get "$CONFIG_PATH" 'CloudKeyPort' '443')"
+  UNIFI_USERNAME="$(config_get "$CONFIG_PATH" 'UniFiUser' 'admin')"
+  UNIFI_SITE="$(config_get "$CONFIG_PATH" 'UniFiSite' 'default')"
+  UNIFI_VERIFY_SSL="$(config_get "$CONFIG_PATH" 'UniFiVerifySSL' 'false')"
+}
+
+interactive_config() {
+  local default_config="$CONFIG_PATH"
+  CONFIG_PATH="$(prompt_default '配置文件路径' "$default_config")"
+  load_config_values
+
+  ROUTEROS_HOST="$(prompt_default 'RouterOS 地址' "$ROUTEROS_HOST")"
+  ROUTEROS_SCHEME="$(prompt_default 'RouterOS REST 协议 http/https' "$ROUTEROS_SCHEME")"
+  ROUTEROS_PORT="$(prompt_default 'RouterOS REST 端口' "$ROUTEROS_PORT")"
+  ROUTEROS_USERNAME="$(prompt_default 'RouterOS 用户名' "$ROUTEROS_USERNAME")"
+  ROUTEROS_PASSWORD="$(prompt_secret 'RouterOS 密码')"
+
+  UNIFI_HOST="$(prompt_default 'Cloud Key 地址' "$UNIFI_HOST")"
+  UNIFI_PORT="$(prompt_default 'Cloud Key HTTPS 端口' "$UNIFI_PORT")"
+  UNIFI_USERNAME="$(prompt_default 'UniFi 用户名' "$UNIFI_USERNAME")"
+  UNIFI_PASSWORD="$(prompt_secret 'UniFi 密码')"
+  UNIFI_SITE="$(prompt_default 'UniFi site' "$UNIFI_SITE")"
+
+  local skip_default="Y"
+  [[ "$UNIFI_VERIFY_SSL" == "true" ]] && skip_default="N"
+  local skip_ssl
+  skip_ssl="$(prompt_default '跳过 Cloud Key SSL 证书校验? Y/N' "$skip_default")"
+  UNIFI_VERIFY_SSL="$(normalize_bool_verify_ssl "$skip_ssl")"
+
+  save_config "$CONFIG_PATH"
+  log_success "配置已保存到 $CONFIG_PATH，密码未保存。"
+}
+
+fetch_routeros_leases() {
+  local insecure=()
+  [[ "$ROUTEROS_SCHEME" == "https" ]] && insecure=(-k)
+  curl -fsS "${insecure[@]}" \
+    -u "${ROUTEROS_USERNAME}:${ROUTEROS_PASSWORD}" \
+    "${ROUTEROS_SCHEME}://${ROUTEROS_HOST}:${ROUTEROS_PORT}/rest/ip/dhcp-server/lease" \
+    | jq 'map(select(((.dynamic // "false") | tostring) == "false") | select((.comment // "") != "") | {mac: ((."mac-address" // "") | ascii_downcase), name: (.comment | tostring)}) | map(select(.mac != "")) | unique_by(.mac)'
+}
+
+unifi_login() {
+  local cookie_file="$1"
+  local insecure=()
+  [[ "$UNIFI_VERIFY_SSL" == "false" ]] && insecure=(-k)
+  local payload
+  payload="$(jq -n --arg username "$UNIFI_USERNAME" --arg password "$UNIFI_PASSWORD" '{username:$username,password:$password,remember:false}')"
+
+  curl -fsS "${insecure[@]}" \
+    -c "$cookie_file" -b "$cookie_file" \
+    -H 'Content-Type: application/json' \
+    -X POST \
+    --data "$payload" \
+    "https://${UNIFI_HOST}:${UNIFI_PORT}/api/auth/login" >/dev/null \
+    || return 1
+}
+
+fetch_unifi_clients() {
+  local cookie_file="$1"
+  local insecure=()
+  [[ "$UNIFI_VERIFY_SSL" == "false" ]] && insecure=(-k)
+  local base="https://${UNIFI_HOST}:${UNIFI_PORT}/proxy/network/api/s/${UNIFI_SITE}"
+  local tmp_sta tmp_user
+  tmp_sta="$(mktemp)"
+  tmp_user="$(mktemp)"
+
+  local sta_ok=1 user_ok=1
+  if ! curl -fsS "${insecure[@]}" -c "$cookie_file" -b "$cookie_file" "$base/stat/sta" > "$tmp_sta"; then
+    echo '{"data":[]}' > "$tmp_sta"
+    sta_ok=0
+  fi
+  if ! curl -fsS "${insecure[@]}" -c "$cookie_file" -b "$cookie_file" "$base/rest/user" > "$tmp_user"; then
+    echo '{"data":[]}' > "$tmp_user"
+    user_ok=0
+  fi
+
+  if [[ "$sta_ok" -eq 0 && "$user_ok" -eq 0 ]]; then
+    rm -f "$tmp_sta" "$tmp_user"
+    return 1
+  fi
+
+  jq -s '[.[0].data[]?, .[1].data[]?] | map(select(.mac != null and ._id != null) | {mac:(.mac|ascii_downcase), id:._id, name:(.name // .hostname // "")}) | unique_by(.mac)' "$tmp_sta" "$tmp_user"
+  rm -f "$tmp_sta" "$tmp_user"
+}
+
+build_plan() {
+  local leases_json="$1"
+  local clients_json="$2"
+  jq -n --argjson leases "$leases_json" --argjson clients "$clients_json" '
+    def bymac($items): reduce $items[] as $item ({}; .[$item.mac] = $item);
+    (bymac($clients)) as $client_map |
+    {
+      update: [$leases[] | . as $lease | $client_map[$lease.mac] as $client | select($client != null) | select(($client.name // "") != $lease.name) | {mac:$lease.mac, id:$client.id, old_name:($client.name // ""), name:$lease.name}],
+      unchanged: [$leases[] | . as $lease | $client_map[$lease.mac] as $client | select($client != null) | select(($client.name // "") == $lease.name) | {mac:$lease.mac, name:$lease.name}],
+      missing: [$leases[] | . as $lease | select($client_map[$lease.mac] == null) | {mac:$lease.mac, name:$lease.name}]
+    }'
+}
+
+update_unifi_client() {
+  local cookie_file="$1"
+  local client_id="$2"
+  local name="$3"
+  local insecure=()
+  [[ "$UNIFI_VERIFY_SSL" == "false" ]] && insecure=(-k)
+  local payload base
+  payload="$(jq -n --arg name "$name" '{name:$name}')"
+  base="https://${UNIFI_HOST}:${UNIFI_PORT}/proxy/network/api/s/${UNIFI_SITE}"
+
+  curl -fsS "${insecure[@]}" \
+    -c "$cookie_file" -b "$cookie_file" \
+    -H 'Content-Type: application/json' \
+    -X PUT \
+    --data "$payload" \
+    "$base/rest/user/${client_id}" >/dev/null
+}
+
+main() {
+  require_cmd curl
+  require_cmd jq
+
+  log_section "启动"
+  if [[ "$SILENT" -eq 1 ]]; then
+    load_config_values
+    log_info "运行模式：静默模式"
+  else
+    interactive_config
+    log_info "运行模式：交互模式"
+  fi
+  print_kv "配置文件" "$CONFIG_PATH"
+  print_kv "RouterOS" "${ROUTEROS_SCHEME}://${ROUTEROS_HOST}:${ROUTEROS_PORT} (${ROUTEROS_USERNAME})"
+  print_kv "Cloud Key" "https://${UNIFI_HOST}:${UNIFI_PORT} (${UNIFI_USERNAME}, site=${UNIFI_SITE})"
+
+  local leases clients plan cookie_file err_file
+  err_file="$(mktemp)"
+
+  log_section "连接 RouterOS"
+  log_info "正在读取 DHCP 静态租约注释..."
+  if leases="$(fetch_routeros_leases 2>"$err_file")"; then
+    :
+  else
+    local reason
+    reason="$(sed 's/^/  /' "$err_file")"
+    rm -f "$err_file"
+    curl_fail "读取 RouterOS DHCP leases 失败。请确认地址、端口、协议、用户名/密码，以及 RouterOS v7 REST API 和 www/www-ssl 服务。${reason:+
+$reason}"
+  fi
+  rm -f "$err_file"
+  local lease_count
+  lease_count="$(jq 'length' <<<"$leases")"
+  log_success "RouterOS 连接成功，获取到 ${lease_count} 条 static 且带注释的 lease。"
+
+  cookie_file="$(mktemp)"
+  trap 'rm -f "$cookie_file"' EXIT
+
+  log_section "连接 Cloud Key"
+  log_info "正在登录 UniFi OS..."
+  err_file="$(mktemp)"
+  if unifi_login "$cookie_file" 2>"$err_file"; then
+    log_success "Cloud Key 登录成功。"
+  else
+    local reason
+    reason="$(sed 's/^/  /' "$err_file")"
+    rm -f "$err_file"
+    curl_fail "UniFi 登录失败。请确认 Cloud Key 地址、用户名、密码和 SSL 设置。${reason:+
+$reason}"
+  fi
+  rm -f "$err_file"
+
+  log_info "正在读取 UniFi active/known clients..."
+  err_file="$(mktemp)"
+  if clients="$(fetch_unifi_clients "$cookie_file" 2>"$err_file")"; then
+    :
+  else
+    local reason
+    reason="$(sed 's/^/  /' "$err_file")"
+    rm -f "$err_file"
+    curl_fail "读取 UniFi clients 失败。请确认 site 名称是否为 '${UNIFI_SITE}'，以及账号是否有 Network 权限。${reason:+
+$reason}"
+  fi
+  rm -f "$err_file"
+  local client_count
+  client_count="$(jq 'length' <<<"$clients")"
+  log_success "Cloud Key 读取成功，获取到 ${client_count} 个 UniFi 已知客户端。"
+
+  log_section "生成同步计划"
+  plan="$(build_plan "$leases" "$clients")"
+
+  local update_count unchanged_count missing_count failed_count=0 success_count=0
+  update_count="$(jq '.update | length' <<<"$plan")"
+  unchanged_count="$(jq '.unchanged | length' <<<"$plan")"
+  missing_count="$(jq '.missing | length' <<<"$plan")"
+  print_kv "准备更新" "$update_count"
+  print_kv "名称已一致" "$unchanged_count"
+  print_kv "UniFi 暂未找到" "$missing_count"
+
+  if [[ "$SILENT" -eq 0 ]]; then
+    if [[ "$update_count" -gt 0 ]]; then
+      log_section "准备更新的客户端"
+      jq -r '.update[] | "  \(.mac)  \(.old_name // "")  ->  \(.name)"' <<<"$plan" >&2
+    fi
+    if [[ "$missing_count" -gt 0 ]]; then
+      log_section "UniFi 暂未找到，跳过"
+      jq -r '.missing[] | "  \(.mac)  \(.name)"' <<<"$plan" >&2
+    fi
+    local confirm
+    read -r -p '是否执行同步? [y/N]: ' confirm
+    case "${confirm,,}" in
+      y|yes) ;;
+      *) log_warn "已取消，未写入 UniFi。"; exit 0 ;;
+    esac
+  fi
+
+  log_section "导入到 Cloud Key"
+  if [[ "$update_count" -eq 0 ]]; then
+    log_success "没有需要更新的客户端。"
+  fi
+  while IFS=$'\t' read -r client_id mac name; do
+    [[ -n "$client_id" ]] || continue
+    printf '  %-17s  %-30s  %s' "$mac" "$name" "...... " >&2
+    err_file="$(mktemp)"
+    if update_unifi_client "$cookie_file" "$client_id" "$name" 2>"$err_file"; then
+      success_count=$((success_count + 1))
+      printf '%ssuccess%s\n' "$C_GREEN" "$C_RESET" >&2
+    else
+      failed_count=$((failed_count + 1))
+      printf '%sfailed%s\n' "$C_RED" "$C_RESET" >&2
+      sed 's/^/    reason: /' "$err_file" >&2
+    fi
+    rm -f "$err_file"
+  done < <(jq -r '.update[] | [.id, .mac, .name] | @tsv' <<<"$plan")
+
+  log_section "完成"
+  print_kv "RouterOS leases" "$lease_count"
+  print_kv "UniFi clients" "$client_count"
+  print_kv "更新成功" "$success_count"
+  print_kv "名称已一致" "$unchanged_count"
+  print_kv "UniFi 未找到" "$missing_count"
+  print_kv "失败" "$failed_count"
+
+  if [[ "$failed_count" -gt 0 ]]; then
+    exit 2
+  fi
+}
+
+main "$@"
