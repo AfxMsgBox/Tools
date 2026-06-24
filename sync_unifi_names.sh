@@ -84,6 +84,7 @@ USAGE
 CONFIG_ARG=""
 ROUTEROS_PASSWORD_ARG=""
 UNIFI_PASSWORD_ARG=""
+UNIFI_CSRF_TOKEN=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -267,16 +268,25 @@ unifi_login() {
   local cookie_file="$1"
   local insecure=()
   [[ "$UNIFI_VERIFY_SSL" == "false" ]] && insecure=(-k)
-  local payload
+  local payload header_file
   payload="$(jq -n --arg username "$UNIFI_USERNAME" --arg password "$UNIFI_PASSWORD" '{username:$username,password:$password,remember:false}')"
+  header_file="$(mktemp)"
 
   curl -fsS "${insecure[@]}" \
     -c "$cookie_file" -b "$cookie_file" \
+    -D "$header_file" \
     -H 'Content-Type: application/json' \
+    -H 'X-Requested-With: XMLHttpRequest' \
     -X POST \
     --data "$payload" \
     "https://${UNIFI_HOST}:${UNIFI_PORT}/api/auth/login" >/dev/null \
-    || return 1
+    || {
+      rm -f "$header_file"
+      return 1
+    }
+
+  UNIFI_CSRF_TOKEN="$(awk 'tolower($1) == "x-csrf-token:" {sub(/\r$/, "", $2); print $2; exit}' "$header_file")"
+  rm -f "$header_file"
 }
 
 fetch_unifi_clients() {
@@ -330,9 +340,12 @@ update_unifi_client() {
   payload="$(jq -n --arg name "$name" '{name:$name}')"
   base="https://${UNIFI_HOST}:${UNIFI_PORT}/proxy/network/api/s/${UNIFI_SITE}"
 
+  local headers=(-H 'Content-Type: application/json' -H 'X-Requested-With: XMLHttpRequest')
+  [[ -n "$UNIFI_CSRF_TOKEN" ]] && headers+=(-H "X-CSRF-Token: ${UNIFI_CSRF_TOKEN}")
+
   curl -fsS "${insecure[@]}" \
     -c "$cookie_file" -b "$cookie_file" \
-    -H 'Content-Type: application/json' \
+    "${headers[@]}" \
     -X PUT \
     --data "$payload" \
     "$base/rest/user/${client_id}" >/dev/null
@@ -384,6 +397,11 @@ $hint}"
   err_file="$(mktemp)"
   if unifi_login "$cookie_file" 2>"$err_file"; then
     log_success "Cloud Key 登录成功。"
+    if [[ -n "$UNIFI_CSRF_TOKEN" ]]; then
+      log_success "已获取 UniFi 写入所需的 CSRF token。"
+    else
+      log_warn "登录响应里没有 CSRF token；如果写入返回 403，请确认 UniFi OS/API 版本。"
+    fi
   else
     local reason
     reason="$(sed 's/^/  /' "$err_file")"
@@ -458,6 +476,13 @@ $hint}"
       failed_count=$((failed_count + 1))
       printf '%sfailed%s\n' "$C_RED" "$C_RESET" >&2
       sed 's/^/    reason: /' "$err_file" >&2
+      if grep -q '403' "$err_file"; then
+        if [[ -n "$UNIFI_CSRF_TOKEN" ]]; then
+          echo "    hint: UniFi 返回 403。脚本已带 CSRF token，请检查该账号是否有 Network 客户端写入权限。" >&2
+        else
+          echo "    hint: UniFi 返回 403，且登录响应未提供 CSRF token；请确认 Cloud Key / UniFi OS 版本或账号类型。" >&2
+        fi
+      fi
     fi
     rm -f "$err_file"
   done < <(jq -r '.update[] | [.id, .mac, .name] | @tsv' <<<"$plan")

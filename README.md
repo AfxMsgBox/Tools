@@ -168,6 +168,14 @@ curl -kI https://10.68.20.2:443/
 
 如果这里也连不上，请优先检查 Cloud Key IP、端口、VLAN/防火墙、Cloud Key 是否开机，以及浏览器实际访问 Cloud Key Web 管理页面时使用的地址和端口。
 
+如果读取客户端成功，但写入每一条都返回：
+
+```text
+curl: (22) The requested URL returned error: 403
+```
+
+通常表示 UniFi OS 拒绝了写操作。脚本登录时会自动读取 UniFi 返回的 `X-CSRF-Token`，并在更新客户端名称时带上这个 token。如果仍然返回 403，请检查当前 UniFi 账号是否有 Network 应用的客户端写入/管理权限，或者 Cloud Key / UniFi OS 版本是否要求不同的 API 权限。
+
 ### 返回码
 
 - `0`：同步完成，没有客户端更新失败。
