@@ -46,6 +46,27 @@ print_kv() {
   printf '  %s%-24s%s %s\n' "$C_DIM" "$1" "$C_RESET" "$2" >&2
 }
 
+curl_hint() {
+  local target="$1"
+  local detail="$2"
+
+  if grep -qiE 'Failed to connect|Could not connect|Connection refused|Connection timed out|No route to host|Network is unreachable' <<<"$detail"; then
+    cat <<EOF_HINT
+  提示：这是 TCP 连接失败，通常不是用户名或密码错误。
+  请先在运行脚本的 Debian 机器上测试：curl -kI ${target}
+  重点检查 IP、端口、VLAN/防火墙、Cloud Key 是否开机，以及 Web 管理页面是否就是这个地址和端口。
+EOF_HINT
+  elif grep -qiE 'SSL certificate|self signed|certificate' <<<"$detail"; then
+    cat <<'EOF_HINT'
+  提示：这是 SSL 证书校验问题。Cloud Key 使用自签证书时，可在配置里设置 UniFiVerifySSL false。
+EOF_HINT
+  elif grep -qiE '401|403|Unauthorized|Forbidden' <<<"$detail"; then
+    cat <<'EOF_HINT'
+  提示：这是认证或权限问题。请检查用户名/密码，并确认该账号有 UniFi Network 管理权限。
+EOF_HINT
+  fi
+}
+
 usage() {
   cat <<'USAGE'
 Usage:
@@ -344,8 +365,11 @@ main() {
     local reason
     reason="$(sed 's/^/  /' "$err_file")"
     rm -f "$err_file"
+    local hint
+    hint="$(curl_hint "${ROUTEROS_SCHEME}://${ROUTEROS_HOST}:${ROUTEROS_PORT}/" "$reason")"
     curl_fail "读取 RouterOS DHCP leases 失败。请确认地址、端口、协议、用户名/密码，以及 RouterOS v7 REST API 和 www/www-ssl 服务。${reason:+
-$reason}"
+$reason}${hint:+
+$hint}"
   fi
   rm -f "$err_file"
   local lease_count
@@ -364,8 +388,11 @@ $reason}"
     local reason
     reason="$(sed 's/^/  /' "$err_file")"
     rm -f "$err_file"
+    local hint
+    hint="$(curl_hint "https://${UNIFI_HOST}:${UNIFI_PORT}/" "$reason")"
     curl_fail "UniFi 登录失败。请确认 Cloud Key 地址、用户名、密码和 SSL 设置。${reason:+
-$reason}"
+$reason}${hint:+
+$hint}"
   fi
   rm -f "$err_file"
 
@@ -377,8 +404,11 @@ $reason}"
     local reason
     reason="$(sed 's/^/  /' "$err_file")"
     rm -f "$err_file"
+    local hint
+    hint="$(curl_hint "https://${UNIFI_HOST}:${UNIFI_PORT}/proxy/network/" "$reason")"
     curl_fail "读取 UniFi clients 失败。请确认 site 名称是否为 '${UNIFI_SITE}'，以及账号是否有 Network 权限。${reason:+
-$reason}"
+$reason}${hint:+
+$hint}"
   fi
   rm -f "$err_file"
   local client_count

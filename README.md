@@ -139,6 +139,35 @@ UniFiVerifySSL false
 
 静默模式不会交互、不会询问确认，会直接同步并输出汇总结果。
 
+### 输出和日志
+
+脚本会按步骤输出当前进度，并在支持颜色的终端里使用彩色状态标记：
+
+- 连接 RouterOS：显示是否连接成功，以及读取到多少条静态且带注释的 lease。
+- 连接 Cloud Key：显示登录是否成功，以及读取到多少个 UniFi active/known clients。
+- 生成同步计划：显示准备更新、名称已一致、UniFi 暂未找到的数量。
+- 导入到 Cloud Key：每一条更新都会输出 MAC、名称和结果，例如：
+
+```text
+  11:33:33:55:66:77  电视机                          ...... success
+```
+
+如果连接、登录、读取或写入失败，脚本会输出失败原因，方便检查地址、端口、协议、账号密码、SSL 设置或 UniFi site 名称。
+
+例如如果看到：
+
+```text
+curl: (7) Failed to connect to 10.68.20.2 port 443 ... Could not connect to server
+```
+
+这表示 Debian 机器无法和 Cloud Key 的 `IP:端口` 建立 TCP 连接，通常不是密码错误。建议先在同一台机器上测试：
+
+```bash
+curl -kI https://10.68.20.2:443/
+```
+
+如果这里也连不上，请优先检查 Cloud Key IP、端口、VLAN/防火墙、Cloud Key 是否开机，以及浏览器实际访问 Cloud Key Web 管理页面时使用的地址和端口。
+
 ### 返回码
 
 - `0`：同步完成，没有客户端更新失败。
