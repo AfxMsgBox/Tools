@@ -39,3 +39,108 @@ Personal tools workspace.
 ./git-pull.sh https://github.com/user/repo.git main scripts/tools ./tools
 ```
 
+
+## RouterOS 静态租约名称同步到 UniFi Cloud Key
+
+`sync_unifi_names.sh` 用于把 MikroTik RouterOS DHCP 静态租约里的中文注释同步到 UniFi Cloud Key 的客户端名称里。
+
+同步规则固定为：
+
+- 只读取 RouterOS DHCP lease 中 `dynamic=false` 的静态租约。
+- 只同步有 `comment` 的租约。
+- 只使用 `mac-address` 和 `comment`。
+- 只更新 UniFi 已经存在或已经记录过的客户端。
+- UniFi 当前找不到的 MAC 会跳过，后续设备上线并被 UniFi 记录后，定期同步会再处理。
+- 不创建 UniFi client。
+- 不修改 RouterOS。
+- 不同步 IP 地址。
+- 不保存密码。
+
+### 依赖
+
+Debian 下安装：
+
+```bash
+sudo apt-get update
+sudo apt-get install curl jq
+```
+
+脚本不依赖 Python，也不依赖第三方语言库，直接用 `curl` 调用 RouterOS REST API 和 UniFi OS API，用 `jq` 处理 JSON。
+
+### 前提
+
+RouterOS 需要支持 REST API，通常要求 RouterOS v7，并启用 `www` 或 `www-ssl` 服务。建议使用 HTTPS：
+
+```routeros
+/ip service enable www-ssl
+```
+
+UniFi 侧按 Cloud Key Gen2 / UniFi OS 路径调用：
+
+```text
+https://<cloudkey>/api/auth/login
+https://<cloudkey>/proxy/network/api/s/<site>/...
+```
+
+### 交互运行
+
+直接运行：
+
+```bash
+./sync_unifi_names.sh
+```
+
+如果没有同时提供三个命令行参数，脚本会进入交互模式：
+
+1. 从默认配置文件读取默认值。
+2. 一步步提示输入 RouterOS 和 UniFi 参数。
+3. 密码现场输入，不保存。
+4. 保存非密码配置到配置文件。
+5. 读取 RouterOS 和 UniFi 数据。
+6. 显示预览。
+7. 最后用 `是否执行同步? [y/N]:` 确认是否写入 UniFi。
+
+默认配置文件是脚本同目录下的：
+
+```text
+unifi_routeros_sync.conf
+```
+
+配置文件不是 JSON，而是简单的字符串对，一行一个键值，格式为 `键 值`。配置文件示例：
+
+```text
+RouterOSIP 192.168.88.1
+RouterOSPort 443
+RouterOSScheme https
+RouterOSUser admin
+CloudKeyIP 192.168.88.2
+CloudKeyPort 443
+UniFiUser admin
+UniFiSite default
+UniFiVerifySSL false
+```
+
+### 静默运行 / 定时任务
+
+脚本只支持三个参数：
+
+- `--config`
+- `--routeros-password`
+- `--unifi-password`
+
+只有三个参数同时指定时，才会进入静默模式，适合定时任务：
+
+```bash
+./sync_unifi_names.sh \
+  --config /opt/routeros-unifi/unifi_routeros_sync.conf \
+  --routeros-password 'RouterOS密码' \
+  --unifi-password 'UniFi密码'
+```
+
+静默模式不会交互、不会询问确认，会直接同步并输出汇总结果。
+
+### 返回码
+
+- `0`：同步完成，没有客户端更新失败。
+- `1`：依赖缺失、配置错误、登录失败或读取 API 失败。
+- `2`：部分 UniFi 客户端更新失败。
