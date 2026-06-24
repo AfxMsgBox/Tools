@@ -124,6 +124,13 @@ CONFIG_ARG=""
 ROUTEROS_PASSWORD_ARG=""
 UNIFI_PASSWORD_ARG=""
 UNIFI_CSRF_TOKEN=""
+COOKIE_FILE=""
+
+# 清理 UniFi 登录 Cookie，避免 EXIT trap 引用 main 的局部变量。
+cleanup() {
+  [[ -n "${COOKIE_FILE:-}" ]] && rm -f "$COOKIE_FILE"
+}
+trap cleanup EXIT
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -414,7 +421,7 @@ main() {
   print_kv "RouterOS" "${ROUTEROS_SCHEME}://${ROUTEROS_HOST}:${ROUTEROS_PORT} (${ROUTEROS_USERNAME})"
   print_kv "Cloud Key" "https://${UNIFI_HOST}:${UNIFI_PORT} (${UNIFI_USERNAME}, site=${UNIFI_SITE})"
 
-  local leases clients plan cookie_file err_file
+  local leases clients plan err_file
   err_file="$(mktemp)"
 
   log_section "连接 RouterOS"
@@ -436,13 +443,12 @@ $hint}"
   lease_count="$(jq 'length' <<<"$leases")"
   log_success "RouterOS 连接成功，获取到 ${lease_count} 条 static 且带注释的 lease。"
 
-  cookie_file="$(mktemp)"
-  trap 'rm -f "$cookie_file"' EXIT
+  COOKIE_FILE="$(mktemp)"
 
   log_section "连接 Cloud Key"
   log_info "正在登录 UniFi OS..."
   err_file="$(mktemp)"
-  if unifi_login "$cookie_file" 2>"$err_file"; then
+  if unifi_login "$COOKIE_FILE" 2>"$err_file"; then
     log_success "Cloud Key 登录成功。"
     if [[ -n "$UNIFI_CSRF_TOKEN" ]]; then
       log_success "已获取 UniFi 写入所需的 CSRF token。"
@@ -463,7 +469,7 @@ $hint}"
 
   log_info "正在读取 UniFi active/known clients..."
   err_file="$(mktemp)"
-  if clients="$(fetch_unifi_clients "$cookie_file" 2>"$err_file")"; then
+  if clients="$(fetch_unifi_clients "$COOKIE_FILE" 2>"$err_file")"; then
     :
   else
     local reason
@@ -520,7 +526,7 @@ $hint}"
     [[ -n "$client_id" ]] || continue
     print_import_prefix "$mac" "$name"
     err_file="$(mktemp)"
-    if update_unifi_client "$cookie_file" "$client_id" "$name" 2>"$err_file"; then
+    if update_unifi_client "$COOKIE_FILE" "$client_id" "$name" 2>"$err_file"; then
       success_count=$((success_count + 1))
       printf '%ssuccess%s\n' "$C_GREEN" "$C_RESET" >&2
     else
