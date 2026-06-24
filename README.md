@@ -64,11 +64,16 @@
 
 | 参数 | 说明 |
 | ---- | ---- |
-| `--config` | 配置文件路径，默认 `./unifi_routeros_sync.conf`。 |
+| `--config` | 配置文件路径，默认 `./sync_unifi_names.conf`。 |
 | `--routeros-password` | RouterOS 密码。 |
 | `--unifi-password` | UniFi 密码。 |
 
-模式：同时提供 `--config` 与两个密码（命令行或配置文件中）即静默执行；否则进入交互模式，会逐项询问并在写入前确认 `是否执行同步? [y/N]`。
+模式：
+
+- **无参数**：交互模式。从默认配置文件 `./sync_unifi_names.conf` 读取作为默认值，逐项询问后预览并确认 `是否执行同步? [y/N]` 才写入。
+- **带任意参数**：静默模式（适合定时任务）。未指定 `--config` 时使用默认配置文件；CLI 给的密码会覆盖配置文件中的同名字段；启动时会检查所有必填字段，缺项立刻报错退出。
+
+旧版默认配置文件名 `unifi_routeros_sync.conf` 已改为 `sync_unifi_names.conf`，本地已有旧文件请手动重命名。
 
 配置文件字段（每行 `键 值`）：
 
@@ -91,7 +96,7 @@
 示例：
 
 ```bash
-./sync_unifi_names.sh --config ./unifi_routeros_sync.conf \
+./sync_unifi_names.sh --config ./sync_unifi_names.conf \
   --routeros-password 'xxx' --unifi-password 'yyy'
 ```
 

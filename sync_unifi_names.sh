@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_CONFIG="${SCRIPT_DIR}/unifi_routeros_sync.conf"
+DEFAULT_CONFIG="${SCRIPT_DIR}/sync_unifi_names.conf"
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   C_RESET=$'\033[0m'
@@ -108,16 +108,22 @@ EOF_HINT
 
 usage() {
   cat <<'USAGE'
-Usage:
-  sync_unifi_names.sh [--config PATH] [--routeros-password PASSWORD] [--unifi-password PASSWORD]
+用法:
+  sync_unifi_names.sh [--config 路径] [--routeros-password 密码] [--unifi-password 密码]
 
-Silent mode:
-  Provide --config plus both passwords, or put RouterOSPassword and UniFiPassword in the config file
-  and run with --config only.
+工作方式:
+  1. 无参数：交互模式。从默认配置文件读取作为默认值，逐项询问后预览并确认写入。
+  2. 任意参数：静默模式，适合定时任务。
+     - 未指定 --config 时使用默认配置文件 ./sync_unifi_names.conf。
+     - 命令行给出的密码会覆盖配置文件中的同名字段。
+     - 配置文件中的 RouterOSPassword / UniFiPassword 为可选项，
+       若命令行未给出，则必须存在于配置文件中，否则启动时即报错退出。
 
-Interactive mode:
-  Without complete passwords, the script reads the key-value config as defaults, prompts step by step,
-  saves non-password config, previews changes, then asks "是否执行同步? [y/N]:" before writing.
+可选参数:
+  --config 路径               配置文件路径。
+  --routeros-password 密码    覆盖配置文件中的 RouterOSPassword。
+  --unifi-password 密码       覆盖配置文件中的 UniFiPassword。
+  -h, --help                  打印本帮助。
 USAGE
 }
 
@@ -125,11 +131,15 @@ CONFIG_ARG=""
 ROUTEROS_PASSWORD_ARG=""
 UNIFI_PASSWORD_ARG=""
 UNIFI_CSRF_TOKEN=""
+WORK_DIR=""
 COOKIE_FILE=""
+HAS_CLI_ARG=0
+ROUTEROS_CURL_OPTS=()
+UNIFI_CURL_OPTS=()
 
-# 清理 UniFi 登录 Cookie，避免 EXIT trap 引用 main 的局部变量。
+# 清理本次运行的临时工作目录，避免遗留 cookie 与中间文件。
 cleanup() {
-  [[ -n "${COOKIE_FILE:-}" ]] && rm -f "$COOKIE_FILE"
+  [[ -n "${WORK_DIR:-}" && -d "$WORK_DIR" ]] && rm -rf "$WORK_DIR"
   return 0
 }
 trap cleanup EXIT
@@ -137,18 +147,21 @@ trap cleanup EXIT
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config)
-      [[ $# -ge 2 ]] || { echo "Missing value for --config" >&2; exit 1; }
+      [[ $# -ge 2 ]] || { echo "缺少 --config 的值" >&2; exit 1; }
       CONFIG_ARG="$2"
+      HAS_CLI_ARG=1
       shift 2
       ;;
     --routeros-password)
-      [[ $# -ge 2 ]] || { echo "Missing value for --routeros-password" >&2; exit 1; }
+      [[ $# -ge 2 ]] || { echo "缺少 --routeros-password 的值" >&2; exit 1; }
       ROUTEROS_PASSWORD_ARG="$2"
+      HAS_CLI_ARG=1
       shift 2
       ;;
     --unifi-password)
-      [[ $# -ge 2 ]] || { echo "Missing value for --unifi-password" >&2; exit 1; }
+      [[ $# -ge 2 ]] || { echo "缺少 --unifi-password 的值" >&2; exit 1; }
       UNIFI_PASSWORD_ARG="$2"
+      HAS_CLI_ARG=1
       shift 2
       ;;
     -h|--help)
@@ -156,7 +169,7 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     *)
-      echo "Unsupported argument: $1" >&2
+      echo "不支持的参数: $1" >&2
       usage >&2
       exit 1
       ;;
@@ -167,17 +180,14 @@ CONFIG_PATH="${CONFIG_ARG:-$DEFAULT_CONFIG}"
 ROUTEROS_PASSWORD="$ROUTEROS_PASSWORD_ARG"
 UNIFI_PASSWORD="$UNIFI_PASSWORD_ARG"
 
-if [[ -n "$CONFIG_ARG" && -n "$ROUTEROS_PASSWORD_ARG" && -n "$UNIFI_PASSWORD_ARG" ]]; then
-  SILENT=1
-else
-  SILENT=0
-fi
+# 只要有任意 CLI 参数就进入静默模式，密码可由命令行或配置文件提供。
+SILENT="$HAS_CLI_ARG"
 
 # 检查运行所需的外部命令。
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
-    echo "Missing required command: $1" >&2
-    echo "On Debian, install dependencies with: sudo apt-get install curl jq" >&2
+    echo "缺少必要命令: $1" >&2
+    echo "请在 Debian 上执行: sudo apt-get install curl jq 安装依赖" >&2
     exit 1
   }
 }
@@ -237,7 +247,9 @@ normalize_bool_verify_ssl() {
 save_config() {
   local path="$1"
   mkdir -p "$(dirname "$path")"
-  cat > "$path" <<EOF_CONFIG
+  (
+    umask 077
+    cat > "$path" <<EOF_CONFIG
 RouterOSIP $ROUTEROS_HOST
 RouterOSPort $ROUTEROS_PORT
 RouterOSScheme $ROUTEROS_SCHEME
@@ -248,6 +260,7 @@ UniFiUser $UNIFI_USERNAME
 UniFiSite $UNIFI_SITE
 UniFiVerifySSL $UNIFI_VERIFY_SSL
 EOF_CONFIG
+  )
   chmod 600 "$path" 2>/dev/null || true
 }
 
@@ -260,7 +273,7 @@ curl_fail() {
 load_config_values() {
   [[ -f "$CONFIG_PATH" ]] || {
     if [[ "$SILENT" -eq 1 ]]; then
-      echo "Config file not found: $CONFIG_PATH" >&2
+      echo "找不到配置文件: $CONFIG_PATH" >&2
       exit 1
     fi
   }
@@ -277,6 +290,33 @@ load_config_values() {
   [[ -z "$UNIFI_PASSWORD" ]] && UNIFI_PASSWORD="$(config_get "$CONFIG_PATH" 'UniFiPassword' '')"
   UNIFI_SITE="$(config_get "$CONFIG_PATH" 'UniFiSite' 'default')"
   UNIFI_VERIFY_SSL="$(config_get "$CONFIG_PATH" 'UniFiVerifySSL' 'false')"
+}
+
+# 静默模式下校验所有必填字段都有值，缺哪个就提前报哪个。
+require_silent_fields() {
+  local missing=()
+  [[ -z "$ROUTEROS_HOST" ]]      && missing+=("RouterOSIP")
+  [[ -z "$ROUTEROS_USERNAME" ]]  && missing+=("RouterOSUser")
+  [[ -z "$ROUTEROS_PASSWORD" ]]  && missing+=("RouterOSPassword 或 --routeros-password")
+  [[ -z "$UNIFI_HOST" ]]         && missing+=("CloudKeyIP")
+  [[ -z "$UNIFI_USERNAME" ]]     && missing+=("UniFiUser")
+  [[ -z "$UNIFI_PASSWORD" ]]     && missing+=("UniFiPassword 或 --unifi-password")
+  if (( ${#missing[@]} > 0 )); then
+    log_error "静默模式缺少以下必填项："
+    local key
+    for key in "${missing[@]}"; do
+      printf '  - %s\n' "$key" >&2
+    done
+    exit 1
+  fi
+}
+
+# 根据配置一次性设置 RouterOS / UniFi 的 curl 通用选项，避免每个函数内重复判断。
+setup_curl_opts() {
+  ROUTEROS_CURL_OPTS=()
+  [[ "$ROUTEROS_SCHEME" == "https" ]] && ROUTEROS_CURL_OPTS=(-k)
+  UNIFI_CURL_OPTS=()
+  [[ "$UNIFI_VERIFY_SSL" == "false" ]] && UNIFI_CURL_OPTS=(-k)
 }
 
 interactive_config() {
@@ -308,9 +348,7 @@ interactive_config() {
 
 # 读取 RouterOS 静态 DHCP 租约，并只保留带注释的 MAC/名称。
 fetch_routeros_leases() {
-  local insecure=()
-  [[ "$ROUTEROS_SCHEME" == "https" ]] && insecure=(-k)
-  curl -fsS "${insecure[@]}" \
+  curl -fsS "${ROUTEROS_CURL_OPTS[@]}" \
     -u "${ROUTEROS_USERNAME}:${ROUTEROS_PASSWORD}" \
     "${ROUTEROS_SCHEME}://${ROUTEROS_HOST}:${ROUTEROS_PORT}/rest/ip/dhcp-server/lease" \
     | jq 'map(select(((.dynamic // "false") | tostring) == "false") | select((.comment // "") != "") | {mac: ((."mac-address" // "") | ascii_downcase), name: (.comment | tostring)}) | map(select(.mac != "")) | unique_by(.mac)'
@@ -319,13 +357,11 @@ fetch_routeros_leases() {
 # 登录 UniFi OS，保存 Cookie，并尽量提取写入接口需要的 CSRF token。
 unifi_login() {
   local cookie_file="$1"
-  local insecure=()
-  [[ "$UNIFI_VERIFY_SSL" == "false" ]] && insecure=(-k)
   local payload header_file
   payload="$(jq -n --arg username "$UNIFI_USERNAME" --arg password "$UNIFI_PASSWORD" '{username:$username,password:$password,remember:false}')"
-  header_file="$(mktemp)"
+  header_file="$WORK_DIR/login_headers"
 
-  curl -fsS "${insecure[@]}" \
+  curl -fsS "${UNIFI_CURL_OPTS[@]}" \
     -c "$cookie_file" -b "$cookie_file" \
     -D "$header_file" \
     -H 'Content-Type: application/json' \
@@ -345,30 +381,25 @@ unifi_login() {
 # 合并 UniFi 当前在线客户端和历史客户端，生成按 MAC 去重的客户端表。
 fetch_unifi_clients() {
   local cookie_file="$1"
-  local insecure=()
-  [[ "$UNIFI_VERIFY_SSL" == "false" ]] && insecure=(-k)
   local base="https://${UNIFI_HOST}:${UNIFI_PORT}/proxy/network/api/s/${UNIFI_SITE}"
-  local tmp_sta tmp_user
-  tmp_sta="$(mktemp)"
-  tmp_user="$(mktemp)"
+  local tmp_sta="$WORK_DIR/unifi_sta.json"
+  local tmp_user="$WORK_DIR/unifi_user.json"
 
   local sta_ok=1 user_ok=1
-  if ! curl -fsS "${insecure[@]}" -c "$cookie_file" -b "$cookie_file" "$base/stat/sta" > "$tmp_sta"; then
+  if ! curl -fsS "${UNIFI_CURL_OPTS[@]}" -c "$cookie_file" -b "$cookie_file" "$base/stat/sta" > "$tmp_sta"; then
     echo '{"data":[]}' > "$tmp_sta"
     sta_ok=0
   fi
-  if ! curl -fsS "${insecure[@]}" -c "$cookie_file" -b "$cookie_file" "$base/rest/user" > "$tmp_user"; then
+  if ! curl -fsS "${UNIFI_CURL_OPTS[@]}" -c "$cookie_file" -b "$cookie_file" "$base/rest/user" > "$tmp_user"; then
     echo '{"data":[]}' > "$tmp_user"
     user_ok=0
   fi
 
   if [[ "$sta_ok" -eq 0 && "$user_ok" -eq 0 ]]; then
-    rm -f "$tmp_sta" "$tmp_user"
     return 1
   fi
 
   jq -s '[.[0].data[]?, .[1].data[]?] | map(select(.mac != null and ._id != null) | {mac:(.mac|ascii_downcase), id:._id, name:(.name // .hostname // "")}) | unique_by(.mac)' "$tmp_sta" "$tmp_user"
-  rm -f "$tmp_sta" "$tmp_user"
 }
 
 # 对比 RouterOS 注释和 UniFi 名称，生成更新/一致/缺失三类计划。
@@ -390,8 +421,6 @@ update_unifi_client() {
   local cookie_file="$1"
   local client_id="$2"
   local name="$3"
-  local insecure=()
-  [[ "$UNIFI_VERIFY_SSL" == "false" ]] && insecure=(-k)
   local payload base
   payload="$(jq -n --arg name "$name" '{name:$name}')"
   base="https://${UNIFI_HOST}:${UNIFI_PORT}/proxy/network/api/s/${UNIFI_SITE}"
@@ -399,7 +428,7 @@ update_unifi_client() {
   local headers=(-H 'Content-Type: application/json' -H 'X-Requested-With: XMLHttpRequest')
   [[ -n "$UNIFI_CSRF_TOKEN" ]] && headers+=(-H "X-CSRF-Token: ${UNIFI_CSRF_TOKEN}")
 
-  curl -fsS "${insecure[@]}" \
+  curl -fsS "${UNIFI_CURL_OPTS[@]}" \
     -c "$cookie_file" -b "$cookie_file" \
     "${headers[@]}" \
     -X PUT \
@@ -411,28 +440,24 @@ main() {
   require_cmd curl
   require_cmd jq
 
-  # 如果指定的配置文件里已经写了两个密码，也可以直接静默运行。
-  if [[ "$SILENT" -eq 0 && -n "$CONFIG_ARG" && -f "$CONFIG_PATH" ]]; then
-    load_config_values
-    if [[ -n "$ROUTEROS_PASSWORD" && -n "$UNIFI_PASSWORD" ]]; then
-      SILENT=1
-    fi
-  fi
+  WORK_DIR="$(mktemp -d)"
 
   log_section "启动"
   if [[ "$SILENT" -eq 1 ]]; then
     load_config_values
+    require_silent_fields
     log_info "运行模式：静默模式"
   else
     interactive_config
     log_info "运行模式：交互模式"
   fi
+  setup_curl_opts
   print_kv "配置文件" "$CONFIG_PATH"
   print_kv "RouterOS" "${ROUTEROS_SCHEME}://${ROUTEROS_HOST}:${ROUTEROS_PORT} (${ROUTEROS_USERNAME})"
   print_kv "Cloud Key" "https://${UNIFI_HOST}:${UNIFI_PORT} (${UNIFI_USERNAME}, site=${UNIFI_SITE})"
 
   local leases clients plan err_file
-  err_file="$(mktemp)"
+  err_file="$WORK_DIR/err"
 
   log_section "连接 RouterOS"
   log_info "正在读取 DHCP 静态租约注释..."
@@ -441,23 +466,20 @@ main() {
   else
     local reason
     reason="$(sed 's/^/  /' "$err_file")"
-    rm -f "$err_file"
     local hint
     hint="$(curl_hint "${ROUTEROS_SCHEME}://${ROUTEROS_HOST}:${ROUTEROS_PORT}/" "$reason")"
     curl_fail "读取 RouterOS DHCP leases 失败。请确认地址、端口、协议、用户名/密码，以及 RouterOS v7 REST API 和 www/www-ssl 服务。${reason:+
 $reason}${hint:+
 $hint}"
   fi
-  rm -f "$err_file"
   local lease_count
   lease_count="$(jq 'length' <<<"$leases")"
   log_success "RouterOS 连接成功，获取到 ${lease_count} 条 static 且带注释的 lease。"
 
-  COOKIE_FILE="$(mktemp)"
+  COOKIE_FILE="$WORK_DIR/unifi_cookies"
 
   log_section "连接 Cloud Key"
   log_info "正在登录 UniFi OS..."
-  err_file="$(mktemp)"
   if unifi_login "$COOKIE_FILE" 2>"$err_file"; then
     log_success "Cloud Key 登录成功。"
     if [[ -n "$UNIFI_CSRF_TOKEN" ]]; then
@@ -468,30 +490,25 @@ $hint}"
   else
     local reason
     reason="$(sed 's/^/  /' "$err_file")"
-    rm -f "$err_file"
     local hint
     hint="$(curl_hint "https://${UNIFI_HOST}:${UNIFI_PORT}/" "$reason")"
     curl_fail "UniFi 登录失败。请确认 Cloud Key 地址、用户名、密码和 SSL 设置。${reason:+
 $reason}${hint:+
 $hint}"
   fi
-  rm -f "$err_file"
 
   log_info "正在读取 UniFi active/known clients..."
-  err_file="$(mktemp)"
   if clients="$(fetch_unifi_clients "$COOKIE_FILE" 2>"$err_file")"; then
     :
   else
     local reason
     reason="$(sed 's/^/  /' "$err_file")"
-    rm -f "$err_file"
     local hint
     hint="$(curl_hint "https://${UNIFI_HOST}:${UNIFI_PORT}/proxy/network/" "$reason")"
     curl_fail "读取 UniFi clients 失败。请确认 site 名称是否为 '${UNIFI_SITE}'，以及账号是否有 Network 权限。${reason:+
 $reason}${hint:+
 $hint}"
   fi
-  rm -f "$err_file"
   local client_count
   client_count="$(jq 'length' <<<"$clients")"
   log_success "Cloud Key 读取成功，获取到 ${client_count} 个 UniFi 已知客户端。"
@@ -535,7 +552,6 @@ $hint}"
   while IFS=$'\t' read -r client_id mac name; do
     [[ -n "$client_id" ]] || continue
     print_import_prefix "$mac" "$name"
-    err_file="$(mktemp)"
     if update_unifi_client "$COOKIE_FILE" "$client_id" "$name" 2>"$err_file"; then
       success_count=$((success_count + 1))
       printf '%ssuccess%s\n' "$C_GREEN" "$C_RESET" >&2
@@ -551,7 +567,6 @@ $hint}"
         fi
       fi
     fi
-    rm -f "$err_file"
   done < <(jq -r '.update[] | [.id, .mac, .name] | @tsv' <<<"$plan")
 
   log_section "完成"
