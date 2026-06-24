@@ -112,11 +112,12 @@ Usage:
   sync_unifi_names.sh [--config PATH] [--routeros-password PASSWORD] [--unifi-password PASSWORD]
 
 Silent mode:
-  If and only if all three arguments are provided, the script runs non-interactively.
+  Provide --config plus both passwords, or put RouterOSPassword and UniFiPassword in the config file
+  and run with --config only.
 
 Interactive mode:
-  If any of the three arguments is missing, the script reads the default key-value config as defaults,
-  prompts step by step, saves the config without passwords, previews changes, then asks "是否执行同步? [y/N]:" before writing.
+  Without complete passwords, the script reads the key-value config as defaults, prompts step by step,
+  saves non-password config, previews changes, then asks "是否执行同步? [y/N]:" before writing.
 USAGE
 }
 
@@ -129,6 +130,7 @@ COOKIE_FILE=""
 # 清理 UniFi 登录 Cookie，避免 EXIT trap 引用 main 的局部变量。
 cleanup() {
   [[ -n "${COOKIE_FILE:-}" ]] && rm -f "$COOKIE_FILE"
+  return 0
 }
 trap cleanup EXIT
 
@@ -161,16 +163,14 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+CONFIG_PATH="${CONFIG_ARG:-$DEFAULT_CONFIG}"
+ROUTEROS_PASSWORD="$ROUTEROS_PASSWORD_ARG"
+UNIFI_PASSWORD="$UNIFI_PASSWORD_ARG"
+
 if [[ -n "$CONFIG_ARG" && -n "$ROUTEROS_PASSWORD_ARG" && -n "$UNIFI_PASSWORD_ARG" ]]; then
   SILENT=1
-  CONFIG_PATH="$CONFIG_ARG"
-  ROUTEROS_PASSWORD="$ROUTEROS_PASSWORD_ARG"
-  UNIFI_PASSWORD="$UNIFI_PASSWORD_ARG"
 else
   SILENT=0
-  CONFIG_PATH="${CONFIG_ARG:-$DEFAULT_CONFIG}"
-  ROUTEROS_PASSWORD=""
-  UNIFI_PASSWORD=""
 fi
 
 # 检查运行所需的外部命令。
@@ -269,10 +269,12 @@ load_config_values() {
   ROUTEROS_PORT="$(config_get "$CONFIG_PATH" 'RouterOSPort' '443')"
   ROUTEROS_SCHEME="$(config_get "$CONFIG_PATH" 'RouterOSScheme' 'https')"
   ROUTEROS_USERNAME="$(config_get "$CONFIG_PATH" 'RouterOSUser' 'admin')"
+  [[ -z "$ROUTEROS_PASSWORD" ]] && ROUTEROS_PASSWORD="$(config_get "$CONFIG_PATH" 'RouterOSPassword' '')"
 
   UNIFI_HOST="$(config_get "$CONFIG_PATH" 'CloudKeyIP' '192.168.88.2')"
   UNIFI_PORT="$(config_get "$CONFIG_PATH" 'CloudKeyPort' '443')"
   UNIFI_USERNAME="$(config_get "$CONFIG_PATH" 'UniFiUser' 'admin')"
+  [[ -z "$UNIFI_PASSWORD" ]] && UNIFI_PASSWORD="$(config_get "$CONFIG_PATH" 'UniFiPassword' '')"
   UNIFI_SITE="$(config_get "$CONFIG_PATH" 'UniFiSite' 'default')"
   UNIFI_VERIFY_SSL="$(config_get "$CONFIG_PATH" 'UniFiVerifySSL' 'false')"
 }
@@ -408,6 +410,14 @@ update_unifi_client() {
 main() {
   require_cmd curl
   require_cmd jq
+
+  # 如果指定的配置文件里已经写了两个密码，也可以直接静默运行。
+  if [[ "$SILENT" -eq 0 && -n "$CONFIG_ARG" && -f "$CONFIG_PATH" ]]; then
+    load_config_values
+    if [[ -n "$ROUTEROS_PASSWORD" && -n "$UNIFI_PASSWORD" ]]; then
+      SILENT=1
+    fi
+  fi
 
   log_section "启动"
   if [[ "$SILENT" -eq 1 ]]; then

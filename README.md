@@ -83,16 +83,30 @@ RouterOSIP 192.168.88.1
 RouterOSPort 443
 RouterOSScheme https
 RouterOSUser admin
+RouterOSPassword 路由器密码
 CloudKeyIP 192.168.88.2
 CloudKeyPort 443
 UniFiUser admin
+UniFiPassword CloudKey密码
 UniFiSite default
 UniFiVerifySSL false
 ```
 
+密码字段是可选的：
+
+- 写了 `RouterOSPassword` 和 `UniFiPassword` 后，可只用 `--config` 静默运行。
+- 不写密码时，交互模式会现场输入；静默模式可用命令行参数传入。
+- 配置文件建议设置为仅自己可读：`chmod 600 unifi_routeros_sync.conf`。
+
 ### 静默运行 / 定时任务
 
-三个参数必须同时提供，才会进入静默模式：
+方式一：密码写在配置文件里。
+
+```bash
+./sync_unifi_names.sh --config /opt/routeros-unifi/unifi_routeros_sync.conf
+```
+
+方式二：密码不写入配置文件，运行时通过参数传入。
 
 ```bash
 ./sync_unifi_names.sh \
