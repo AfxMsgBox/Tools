@@ -42,8 +42,47 @@ log_error() {
   printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$1" >&2
 }
 
+# 计算字符串在终端中的显示宽度：ASCII 按 1 列，常见中文按 2 列近似处理。
+display_width() {
+  local text="$1"
+  local char_len byte_len
+  char_len=${#text}
+  byte_len=$(LC_ALL=C; printf '%s' "$text" | wc -c | tr -d ' ')
+  printf '%d\n' $((char_len + (byte_len - char_len) / 2))
+}
+
+# 按显示宽度右侧补空格，避免中文字符导致 printf 宽度错位。
+pad_right() {
+  local text="$1"
+  local target_width="$2"
+  local width pad
+  width=$(display_width "$text")
+  pad=$((target_width - width))
+  (( pad < 0 )) && pad=0
+  printf '%s%*s' "$text" "$pad" ''
+}
+
+# 打印两列键值摘要。
 print_kv() {
-  printf '  %s%-24s%s %s\n' "$C_DIM" "$1" "$C_RESET" "$2" >&2
+  printf '  %s%s%s %s\n' "$C_DIM" "$(pad_right "$1" 20)" "$C_RESET" "$2" >&2
+}
+
+# 打印预览表格中的“旧名称 -> 新名称”。
+print_plan_update_row() {
+  local mac="$1" old_name="$2" new_name="$3"
+  printf '  %s  %s ->  %s\n' "$(pad_right "$mac" 17)" "$(pad_right "$old_name" 34)" "$new_name" >&2
+}
+
+# 打印 UniFi 未找到的客户端。
+print_plan_missing_row() {
+  local mac="$1" name="$2"
+  printf '  %s  %s\n' "$(pad_right "$mac" 17)" "$name" >&2
+}
+
+# 打印导入进度，结果列固定在同一位置。
+print_import_prefix() {
+  local mac="$1" name="$2"
+  printf '  %s  %s  ...... ' "$(pad_right "$mac" 17)" "$(pad_right "$name" 34)" >&2
 }
 
 curl_hint() {
@@ -85,6 +124,13 @@ CONFIG_ARG=""
 ROUTEROS_PASSWORD_ARG=""
 UNIFI_PASSWORD_ARG=""
 UNIFI_CSRF_TOKEN=""
+COOKIE_FILE=""
+
+# 清理 UniFi 登录 Cookie，避免 EXIT trap 引用 main 的局部变量。
+cleanup() {
+  [[ -n "${COOKIE_FILE:-}" ]] && rm -f "$COOKIE_FILE"
+}
+trap cleanup EXIT
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -127,6 +173,7 @@ else
   UNIFI_PASSWORD=""
 fi
 
+# 检查运行所需的外部命令。
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
     echo "Missing required command: $1" >&2
@@ -135,6 +182,7 @@ require_cmd() {
   }
 }
 
+# 从“键 值”配置文件读取配置，缺失时使用默认值。
 config_get() {
   local file="$1"
   local key="$2"
@@ -185,6 +233,7 @@ normalize_bool_verify_ssl() {
   esac
 }
 
+# 只保存非敏感配置，密码始终由交互或命令行提供。
 save_config() {
   local path="$1"
   mkdir -p "$(dirname "$path")"
@@ -255,6 +304,7 @@ interactive_config() {
   log_success "配置已保存到 $CONFIG_PATH，密码未保存。"
 }
 
+# 读取 RouterOS 静态 DHCP 租约，并只保留带注释的 MAC/名称。
 fetch_routeros_leases() {
   local insecure=()
   [[ "$ROUTEROS_SCHEME" == "https" ]] && insecure=(-k)
@@ -264,6 +314,7 @@ fetch_routeros_leases() {
     | jq 'map(select(((.dynamic // "false") | tostring) == "false") | select((.comment // "") != "") | {mac: ((."mac-address" // "") | ascii_downcase), name: (.comment | tostring)}) | map(select(.mac != "")) | unique_by(.mac)'
 }
 
+# 登录 UniFi OS，保存 Cookie，并尽量提取写入接口需要的 CSRF token。
 unifi_login() {
   local cookie_file="$1"
   local insecure=()
@@ -289,6 +340,7 @@ unifi_login() {
   rm -f "$header_file"
 }
 
+# 合并 UniFi 当前在线客户端和历史客户端，生成按 MAC 去重的客户端表。
 fetch_unifi_clients() {
   local cookie_file="$1"
   local insecure=()
@@ -317,6 +369,7 @@ fetch_unifi_clients() {
   rm -f "$tmp_sta" "$tmp_user"
 }
 
+# 对比 RouterOS 注释和 UniFi 名称，生成更新/一致/缺失三类计划。
 build_plan() {
   local leases_json="$1"
   local clients_json="$2"
@@ -330,6 +383,7 @@ build_plan() {
     }'
 }
 
+# 将单个客户端名称写回 UniFi。
 update_unifi_client() {
   local cookie_file="$1"
   local client_id="$2"
@@ -367,7 +421,7 @@ main() {
   print_kv "RouterOS" "${ROUTEROS_SCHEME}://${ROUTEROS_HOST}:${ROUTEROS_PORT} (${ROUTEROS_USERNAME})"
   print_kv "Cloud Key" "https://${UNIFI_HOST}:${UNIFI_PORT} (${UNIFI_USERNAME}, site=${UNIFI_SITE})"
 
-  local leases clients plan cookie_file err_file
+  local leases clients plan err_file
   err_file="$(mktemp)"
 
   log_section "连接 RouterOS"
@@ -389,13 +443,12 @@ $hint}"
   lease_count="$(jq 'length' <<<"$leases")"
   log_success "RouterOS 连接成功，获取到 ${lease_count} 条 static 且带注释的 lease。"
 
-  cookie_file="$(mktemp)"
-  trap 'rm -f "$cookie_file"' EXIT
+  COOKIE_FILE="$(mktemp)"
 
   log_section "连接 Cloud Key"
   log_info "正在登录 UniFi OS..."
   err_file="$(mktemp)"
-  if unifi_login "$cookie_file" 2>"$err_file"; then
+  if unifi_login "$COOKIE_FILE" 2>"$err_file"; then
     log_success "Cloud Key 登录成功。"
     if [[ -n "$UNIFI_CSRF_TOKEN" ]]; then
       log_success "已获取 UniFi 写入所需的 CSRF token。"
@@ -416,7 +469,7 @@ $hint}"
 
   log_info "正在读取 UniFi active/known clients..."
   err_file="$(mktemp)"
-  if clients="$(fetch_unifi_clients "$cookie_file" 2>"$err_file")"; then
+  if clients="$(fetch_unifi_clients "$COOKIE_FILE" 2>"$err_file")"; then
     :
   else
     local reason
@@ -447,11 +500,15 @@ $hint}"
   if [[ "$SILENT" -eq 0 ]]; then
     if [[ "$update_count" -gt 0 ]]; then
       log_section "准备更新的客户端"
-      jq -r '.update[] | "  \(.mac)  \(.old_name // "")  ->  \(.name)"' <<<"$plan" >&2
+      while IFS=$'\t' read -r mac old_name name; do
+        print_plan_update_row "$mac" "$old_name" "$name"
+      done < <(jq -r '.update[] | [.mac, (.old_name // ""), .name] | @tsv' <<<"$plan")
     fi
     if [[ "$missing_count" -gt 0 ]]; then
       log_section "UniFi 暂未找到，跳过"
-      jq -r '.missing[] | "  \(.mac)  \(.name)"' <<<"$plan" >&2
+      while IFS=$'\t' read -r mac name; do
+        print_plan_missing_row "$mac" "$name"
+      done < <(jq -r '.missing[] | [.mac, .name] | @tsv' <<<"$plan")
     fi
     local confirm
     read -r -p '是否执行同步? [y/N]: ' confirm
@@ -467,9 +524,9 @@ $hint}"
   fi
   while IFS=$'\t' read -r client_id mac name; do
     [[ -n "$client_id" ]] || continue
-    printf '  %-17s  %-30s  %s' "$mac" "$name" "...... " >&2
+    print_import_prefix "$mac" "$name"
     err_file="$(mktemp)"
-    if update_unifi_client "$cookie_file" "$client_id" "$name" 2>"$err_file"; then
+    if update_unifi_client "$COOKIE_FILE" "$client_id" "$name" 2>"$err_file"; then
       success_count=$((success_count + 1))
       printf '%ssuccess%s\n' "$C_GREEN" "$C_RESET" >&2
     else
